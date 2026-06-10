@@ -114,6 +114,9 @@ const initializeClient = () => {
         qrCodeImage = null;
         qrCodeRaw = null;
         triggerWebhook('status_change', { status: 'CONNECTED', info: client.info });
+
+        // Auto-sync chats to CRM after connection
+        setTimeout(() => syncChatsToWebhook(), 3000);
     });
 
     client.on('authenticated', () => {
@@ -349,6 +352,57 @@ app.post('/reconnect', authenticate, async (req, res) => {
     } catch (err) {
         console.error('[API] Error during reconnect:', err);
         res.status(500).json({ success: false, error: err.message });
+    }
+});
+
+// --- CHAT SYNC HELPERS ---
+
+/**
+ * Fetch latest 50 chats from WhatsApp and fire a webhook to CRM
+ */
+const syncChatsToWebhook = async () => {
+    if (connectionStatus !== 'CONNECTED' || !client) {
+        console.log('[Sync] Cannot sync chats: client is not connected.');
+        return { success: false, error: 'Client not connected' };
+    }
+
+    try {
+        console.log('[Sync] Fetching chats from WhatsApp...');
+        const allChats = await client.getChats();
+
+        // Filter to 50, skip status broadcast
+        const filtered = allChats
+            .filter(c => c.id._serialized !== 'status@broadcast')
+            .slice(0, 50);
+
+        const chatPayload = filtered.map(chat => ({
+            chat_id:           chat.id._serialized,
+            chat_name:         chat.name || chat.id.user,
+            phone_number:      chat.isGroup ? null : chat.id.user,
+            is_group:          chat.isGroup ? 1 : 0,
+            unread_count:      chat.unreadCount || 0,
+            last_message:      chat.lastMessage ? chat.lastMessage.body : null,
+            last_message_time: chat.lastMessage ? chat.lastMessage.timestamp : null,
+            timestamp:         chat.timestamp || null
+        }));
+
+        console.log(`[Sync] Syncing ${chatPayload.length} chats to CRM webhook.`);
+        await triggerWebhook('chats_sync', { chats: chatPayload, count: chatPayload.length });
+
+        return { success: true, count: chatPayload.length };
+    } catch (err) {
+        console.error('[Sync] Failed to fetch or sync chats:', err.message);
+        return { success: false, error: err.message };
+    }
+};
+
+// GET /sync-chats - Manually trigger a chat sync from CRM
+app.get('/sync-chats', authenticate, async (req, res) => {
+    const result = await syncChatsToWebhook();
+    if (result.success) {
+        res.json({ success: true, message: `Synced ${result.count} chats to CRM.`, count: result.count });
+    } else {
+        res.status(503).json({ success: false, error: result.error || 'Sync failed.' });
     }
 });
 
