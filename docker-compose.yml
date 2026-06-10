@@ -1,0 +1,23 @@
+version: '3.8'
+
+services:
+  whatsapp-gateway:
+    build: .
+    image: avp-whatsapp-gateway:latest
+    container_name: avp-whatsapp-gateway
+    ports:
+      - "5001:5001"
+    environment:
+      - PORT=5001
+      - HOST=0.0.0.0
+      - GATEWAY_API_KEY=avp_whatsapp_secure_gateway_token_12345
+      - CRM_WEBHOOK_URL=https://stockarth.com/crm/avp_whatsapp/webhook
+      - CRM_API_TOKEN=avp_whatsapp_secure_crm_token_54321
+      - SESSION_PATH=/app/session
+    volumes:
+      - whatsapp_session:/app/session
+    restart: always
+
+volumes:
+  whatsapp_session:
+    name: avp_whatsapp_session
