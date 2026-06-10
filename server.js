@@ -70,22 +70,30 @@ const initializeClient = () => {
     qrCodeImage = null;
     qrCodeRaw = null;
 
+    const puppeteerOptions = {
+        headless: true,
+        args: [
+            '--no-sandbox',
+            '--disable-setuid-sandbox',
+            '--disable-dev-shm-usage',
+            '--disable-accelerated-2d-canvas',
+            '--no-first-run',
+            '--no-zygote',
+            '--disable-gpu'
+        ]
+    };
+
+    if (process.env.CHROME_PATH || fs.existsSync('/usr/bin/google-chrome-stable')) {
+        puppeteerOptions.executablePath = process.env.CHROME_PATH || '/usr/bin/google-chrome-stable';
+    } else if (fs.existsSync('/usr/bin/google-chrome')) {
+        puppeteerOptions.executablePath = '/usr/bin/google-chrome';
+    }
+
     client = new Client({
         authStrategy: new LocalAuth({
             dataPath: SESSION_PATH
         }),
-        puppeteer: {
-            headless: true,
-            args: [
-                '--no-sandbox',
-                '--disable-setuid-sandbox',
-                '--disable-dev-shm-usage',
-                '--disable-accelerated-2d-canvas',
-                '--no-first-run',
-                '--no-zygote',
-                '--disable-gpu'
-            ]
-        }
+        puppeteer: puppeteerOptions
     });
 
     client.on('qr', async (qr) => {
