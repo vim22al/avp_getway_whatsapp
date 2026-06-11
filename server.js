@@ -145,19 +145,20 @@ const initializeClient = () => {
     client.on('auth_failure', (msg) => {
         console.error('[Client] Authentication failure:', msg);
         connectionStatus = 'DISCONNECTED';
+        global.whatsappClientInitialized = false;
         triggerWebhook('status_change', { status: 'DISCONNECTED', error: msg });
-        process.exit(1); // Force container restart on auth failure
+        destroyClient();
     });
 
     client.on('disconnected', (reason) => {
         console.log('[Client] Disconnected:', reason);
         connectionStatus = 'DISCONNECTED';
+        global.whatsappClientInitialized = false;
         qrCodeImage = null;
         qrCodeRaw = null;
         triggerWebhook('status_change', { status: 'DISCONNECTED', reason });
         
-        // Let Docker/Coolify handle the restart instead of reconnect loops
-        process.exit(1);
+        destroyClient();
     });
 
     // Capture incoming messages (from recipients/contacts)
@@ -199,7 +200,9 @@ const initializeClient = () => {
 
     client.initialize().catch(err => {
         console.error('[Client] Initialization error:', err.message || err);
-        process.exit(1); // Force container restart on fatal initialization error
+        connectionStatus = 'DISCONNECTED';
+        global.whatsappClientInitialized = false;
+        destroyClient();
     });
 };
 
@@ -280,17 +283,29 @@ app.get('/health', (req, res) => {
     });
 });
 
+// GET /debug - Test endpoint for CRM
+app.get('/debug', (req, res) => {
+    res.json({
+        server: "running",
+        clientInitialized: !!global.whatsappClientInitialized,
+        clientState: connectionStatus,
+        hasQr: !!qrCodeImage
+    });
+});
+
 // GET /status - Fetch current connection status
 app.get(['/status', '/api/status'], authenticate, (req, res) => {
+    console.log('[API] /status requested');
     res.json({
         success: true,
         status: connectionStatus,
-        hasSession: fs.existsSync(path.join(SESSION_PATH, 'Default'))
+        hasSession: fs.existsSync(path.join('.wwebjs_auth', 'session-avpcrm'))
     });
 });
 
 // GET /qr - Fetch current QR Code base64 image
 app.get('/qr', authenticate, (req, res) => {
+    console.log('[API] /qr requested');
     if (connectionStatus === 'QR_READY' && qrCodeImage) {
         res.json({ success: true, qr: qrCodeImage, raw: qrCodeRaw });
     } else {
@@ -406,19 +421,20 @@ app.post(['/disconnect', '/logout'], authenticate, async (req, res) => {
 });
 
 // POST /reconnect - Force client reinitialization
-app.post('/reconnect', authenticate, async (req, res) => {
-    console.log('[API] Reconnect requested');
+app.post(['/reconnect', '/initialize'], authenticate, async (req, res) => {
+    console.log('[API] Reconnect/Initialize requested');
     try {
         await destroyClient();
         connectionStatus = 'DISCONNECTED';
+        global.whatsappClientInitialized = false;
         qrCodeImage = null;
         qrCodeRaw = null;
         
         initializeClient();
-        res.json({ success: true, message: 'Reinitialization started.' });
+        res.json({ success: true, message: 'Initialization started' });
     } catch (err) {
         console.error('[API] Error during reconnect:', err);
-        res.status(500).json({ success: false, error: err.message });
+        res.status(500).json({ success: false, error: err.message || "Unknown error" });
     }
 });
 
