@@ -285,9 +285,7 @@ initializeClient();
 // GET /health - Health check endpoint
 app.get('/health', (req, res) => {
     res.json({
-        status: "ok",
-        gateway: "running",
-        whatsapp: connectionStatus
+        status: "ok"
     });
 });
 
@@ -440,18 +438,8 @@ app.post(['/reconnect', '/initialize'], authenticate, async (req, res) => {
         
         initializeClient();
         
-        // Wait until QR_READY or CONNECTED to return success
-        let attempts = 0;
-        const checkReady = setInterval(() => {
-            attempts++;
-            if (connectionStatus === 'QR_READY' || connectionStatus === 'CONNECTED') {
-                clearInterval(checkReady);
-                res.json({ success: true, message: 'Initialization started' });
-            } else if (attempts > 30) { // 30 seconds timeout
-                clearInterval(checkReady);
-                res.status(500).json({ success: false, error: "Initialization timed out" });
-            }
-        }, 1000);
+        // Return immediately so CRM cURL doesn't timeout (10s limit)
+        res.json({ success: true, message: 'Initialization started' });
 
     } catch (err) {
         console.error('[API] Error during reconnect:', err);
@@ -653,5 +641,6 @@ app.get('/api/contacts', authenticate, async (req, res) => {
 
 // Start Server
 app.listen(PORT, HOST, () => {
-    console.log(`[Gateway] Server is running on http://${HOST}:${PORT}`);
+    console.log(`[Server] Listening on port ${PORT}`);
+    console.log(`[Server] Gateway ready`);
 });
