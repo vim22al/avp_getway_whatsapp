@@ -16,7 +16,7 @@ const CRM_WEBHOOK_URL = process.env.CRM_WEBHOOK_URL;
 const CRM_API_TOKEN = process.env.CRM_API_TOKEN;
 const SESSION_PATH = process.env.SESSION_PATH || './session';
 
-let isInitializing = false;
+
 
 app.use(cors());
 app.use(express.json({ limit: '50mb' }));
@@ -65,85 +65,58 @@ const triggerWebhook = async (event, data) => {
     }
 };
 
-// Kill zombie chrome processes (good for docker)
-const killZombieChrome = () => {
+// Cleanup startup routines
+const startupCleanup = () => {
     try {
-        console.log('[Client] Attempting to kill zombie Chrome processes...');
         execSync('pkill -f chrome || pkill -f chromium');
-        console.log('[Client] Zombie Chrome processes killed.');
-    } catch (e) {
-        console.log('[Client] No zombie Chrome processes found or could not kill.');
-    }
-};
+    } catch (e) {}
 
-// Clear stale lock files from Chrome user data dir
-const clearLocks = () => {
-    const sessionDir = path.join(SESSION_PATH, 'session');
-    const lockFiles = ['SingletonLock', 'SingletonCookie', 'SingletonSocket'];
-    if (fs.existsSync(sessionDir)) {
-        lockFiles.forEach(file => {
-            const filePath = path.join(sessionDir, file);
-            if (fs.existsSync(filePath)) {
-                try {
-                    fs.unlinkSync(filePath);
-                    console.log(`[Client] Cleared stale lock file: ${filePath}`);
-                } catch (e) {
-                    console.error(`[Client] Failed to clear lock file: ${filePath}`, e.message);
-                }
-            }
-        });
-    }
+    try {
+        // Force delete all potential Chrome lock files across common whatsapp-web.js paths
+        execSync('rm -rf .wwebjs_auth/**/Singleton* || true');
+        execSync('rm -rf .session/**/Singleton* || true');
+        execSync('rm -rf .auth/*Singleton* || true');
+    } catch (e) {}
 };
 
 // Initialize WhatsApp Client
-const initializeClient = (retryCount = 0) => {
-    if (client && connectionStatus === 'CONNECTED') {
-        console.log('[Client] Client already connected. Skipping initialization.');
+const initializeClient = () => {
+    if (global.whatsappClientInitialized) {
         return;
     }
+    global.whatsappClientInitialized = true;
 
-    if (isInitializing) {
-        console.log('[Client] Initialization already in progress. Skipping.');
-        return;
-    }
+    startupCleanup();
 
-    isInitializing = true;
-    killZombieChrome();
-    clearLocks();
-
-    console.log('[Client] Client starting...');
+    console.log('[Client] Starting');
+    console.log('[Client] Auth directory');
+    
     connectionStatus = 'INITIALIZING';
     qrCodeImage = null;
     qrCodeRaw = null;
 
-    const puppeteerOptions = {
+    console.log('[Client] Browser launching');
+    
+    client = new Client({
+      authStrategy: new LocalAuth({
+        clientId: 'avpcrm'
+      }),
+      puppeteer: {
         headless: true,
         args: [
-            '--no-sandbox',
-            '--disable-setuid-sandbox',
-            '--disable-dev-shm-usage',
-            '--disable-gpu',
-            '--no-first-run',
-            '--no-zygote',
-            '--single-process'
+          '--no-sandbox',
+          '--disable-setuid-sandbox',
+          '--disable-dev-shm-usage',
+          '--disable-gpu',
+          '--no-first-run',
+          '--no-zygote',
+          '--single-process'
         ]
-    };
-
-    if (process.env.CHROME_PATH || fs.existsSync('/usr/bin/google-chrome-stable')) {
-        puppeteerOptions.executablePath = process.env.CHROME_PATH || '/usr/bin/google-chrome-stable';
-    } else if (fs.existsSync('/usr/bin/google-chrome')) {
-        puppeteerOptions.executablePath = '/usr/bin/google-chrome';
-    }
-
-    client = new Client({
-        authStrategy: new LocalAuth({
-            dataPath: SESSION_PATH
-        }),
-        puppeteer: puppeteerOptions
+      }
     });
 
     client.on('qr', async (qr) => {
-        console.log('[Client] QR generated');
+        console.log('[Client] QR_READY');
         qrCodeRaw = qr;
         connectionStatus = 'QR_READY';
         try {
@@ -155,11 +128,8 @@ const initializeClient = (retryCount = 0) => {
     });
 
     client.on('ready', () => {
-        console.log('[Client] Ready');
-        console.log('[Client] WhatsApp Client Ready');
-        console.log('[Client] Connected');
+        console.log('[Client] READY');
         connectionStatus = 'CONNECTED';
-        isInitializing = false;
         qrCodeImage = null;
         qrCodeRaw = null;
         triggerWebhook('status_change', { status: 'CONNECTED', info: client.info });
@@ -169,26 +139,25 @@ const initializeClient = (retryCount = 0) => {
     });
 
     client.on('authenticated', () => {
-        console.log('[Client] Authenticated');
+        console.log('[Client] AUTHENTICATED');
     });
 
     client.on('auth_failure', (msg) => {
         console.error('[Client] Authentication failure:', msg);
         connectionStatus = 'DISCONNECTED';
-        isInitializing = false;
         triggerWebhook('status_change', { status: 'DISCONNECTED', error: msg });
+        process.exit(1); // Force container restart on auth failure
     });
 
     client.on('disconnected', (reason) => {
         console.log('[Client] Disconnected:', reason);
         connectionStatus = 'DISCONNECTED';
-        isInitializing = false;
         qrCodeImage = null;
         qrCodeRaw = null;
         triggerWebhook('status_change', { status: 'DISCONNECTED', reason });
         
-        // Destroy client reference
-        destroyClient();
+        // Let Docker/Coolify handle the restart instead of reconnect loops
+        process.exit(1);
     });
 
     // Capture incoming messages (from recipients/contacts)
@@ -228,19 +197,9 @@ const initializeClient = (retryCount = 0) => {
         });
     });
 
-    client.initialize().then(() => {
-        console.log('[Client] Browser launched');
-    }).catch(err => {
+    client.initialize().catch(err => {
         console.error('[Client] Initialization error:', err.message || err);
-        connectionStatus = 'DISCONNECTED';
-        client = null;
-        isInitializing = false;
-        
-        if (retryCount < 5) {
-            const delay = Math.pow(2, retryCount) * 5000;
-            console.log(`[Client] Reconnecting (${retryCount + 1}/5) in ${delay / 1000}s...`);
-            setTimeout(() => initializeClient(retryCount + 1), delay);
-        }
+        process.exit(1); // Force container restart on fatal initialization error
     });
 };
 
