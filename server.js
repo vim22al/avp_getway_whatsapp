@@ -5,6 +5,7 @@ const axios = require('axios');
 const cors = require('cors');
 const fs = require('fs');
 const path = require('path');
+const { execSync } = require('child_process');
 require('dotenv').config();
 
 const app = express();
@@ -14,6 +15,8 @@ const GATEWAY_API_KEY = process.env.GATEWAY_API_KEY || 'avp_whatsapp_secure_gate
 const CRM_WEBHOOK_URL = process.env.CRM_WEBHOOK_URL;
 const CRM_API_TOKEN = process.env.CRM_API_TOKEN;
 const SESSION_PATH = process.env.SESSION_PATH || './session';
+
+let isInitializing = false;
 
 app.use(cors());
 app.use(express.json({ limit: '50mb' }));
@@ -62,6 +65,17 @@ const triggerWebhook = async (event, data) => {
     }
 };
 
+// Kill zombie chrome processes (good for docker)
+const killZombieChrome = () => {
+    try {
+        console.log('[Client] Attempting to kill zombie Chrome processes...');
+        execSync('pkill -f chrome || pkill -f chromium');
+        console.log('[Client] Zombie Chrome processes killed.');
+    } catch (e) {
+        console.log('[Client] No zombie Chrome processes found or could not kill.');
+    }
+};
+
 // Clear stale lock files from Chrome user data dir
 const clearLocks = () => {
     const sessionDir = path.join(SESSION_PATH, 'session');
@@ -83,14 +97,21 @@ const clearLocks = () => {
 
 // Initialize WhatsApp Client
 const initializeClient = (retryCount = 0) => {
-    if (client) {
-        console.log('[Client] Client already exists. Skipping initialization.');
+    if (client && connectionStatus === 'CONNECTED') {
+        console.log('[Client] Client already connected. Skipping initialization.');
         return;
     }
 
+    if (isInitializing) {
+        console.log('[Client] Initialization already in progress. Skipping.');
+        return;
+    }
+
+    isInitializing = true;
+    killZombieChrome();
     clearLocks();
 
-    console.log('[Client] Starting initialization...');
+    console.log('[Client] Client starting...');
     connectionStatus = 'INITIALIZING';
     qrCodeImage = null;
     qrCodeRaw = null;
@@ -103,7 +124,8 @@ const initializeClient = (retryCount = 0) => {
             '--disable-dev-shm-usage',
             '--disable-gpu',
             '--no-first-run',
-            '--no-zygote'
+            '--no-zygote',
+            '--single-process'
         ]
     };
 
@@ -121,7 +143,7 @@ const initializeClient = (retryCount = 0) => {
     });
 
     client.on('qr', async (qr) => {
-        console.log('[Client] QR Generated');
+        console.log('[Client] QR generated');
         qrCodeRaw = qr;
         connectionStatus = 'QR_READY';
         try {
@@ -133,9 +155,11 @@ const initializeClient = (retryCount = 0) => {
     });
 
     client.on('ready', () => {
+        console.log('[Client] Ready');
         console.log('[Client] WhatsApp Client Ready');
         console.log('[Client] Connected');
         connectionStatus = 'CONNECTED';
+        isInitializing = false;
         qrCodeImage = null;
         qrCodeRaw = null;
         triggerWebhook('status_change', { status: 'CONNECTED', info: client.info });
@@ -151,12 +175,14 @@ const initializeClient = (retryCount = 0) => {
     client.on('auth_failure', (msg) => {
         console.error('[Client] Authentication failure:', msg);
         connectionStatus = 'DISCONNECTED';
+        isInitializing = false;
         triggerWebhook('status_change', { status: 'DISCONNECTED', error: msg });
     });
 
     client.on('disconnected', (reason) => {
         console.log('[Client] Disconnected:', reason);
         connectionStatus = 'DISCONNECTED';
+        isInitializing = false;
         qrCodeImage = null;
         qrCodeRaw = null;
         triggerWebhook('status_change', { status: 'DISCONNECTED', reason });
@@ -202,13 +228,18 @@ const initializeClient = (retryCount = 0) => {
         });
     });
 
-    client.initialize().catch(err => {
+    client.initialize().then(() => {
+        console.log('[Client] Browser launched');
+    }).catch(err => {
         console.error('[Client] Initialization error:', err.message || err);
         connectionStatus = 'DISCONNECTED';
         client = null;
-        if (retryCount < 3) {
-            console.log(`[Client] Retrying initialization (${retryCount + 1}/3) in 5s...`);
-            setTimeout(() => initializeClient(retryCount + 1), 5000);
+        isInitializing = false;
+        
+        if (retryCount < 5) {
+            const delay = Math.pow(2, retryCount) * 5000;
+            console.log(`[Client] Reconnecting (${retryCount + 1}/5) in ${delay / 1000}s...`);
+            setTimeout(() => initializeClient(retryCount + 1), delay);
         }
     });
 };
@@ -280,6 +311,15 @@ const destroyClient = async () => {
 initializeClient();
 
 // --- API ROUTES ---
+
+// GET /health - Health check endpoint
+app.get('/health', (req, res) => {
+    res.json({
+        status: "ok",
+        gateway: "running",
+        whatsapp: connectionStatus
+    });
+});
 
 // GET /status - Fetch current connection status
 app.get(['/status', '/api/status'], authenticate, (req, res) => {
@@ -374,8 +414,8 @@ app.post('/send-media', authenticate, async (req, res) => {
     }
 });
 
-// POST /disconnect - Terminate WhatsApp session and log out
-app.post('/disconnect', authenticate, async (req, res) => {
+// POST /disconnect or /logout - Terminate WhatsApp session and log out
+app.post(['/disconnect', '/logout'], authenticate, async (req, res) => {
     console.log('[API] Disconnect requested');
     try {
         if (client) {
