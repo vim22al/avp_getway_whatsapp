@@ -72,7 +72,6 @@ const startupCleanup = () => {
     } catch (e) {}
 
     try {
-        execSync('rm -rf /tmp/chrome-profile* || true');
         execSync('rm -f .wwebjs_auth/**/Singleton* || true');
         execSync('rm -f .session/**/Singleton* || true');
         execSync('rm -f .auth/*Singleton* || true');
@@ -108,16 +107,16 @@ const initializeClient = () => {
           '--no-sandbox',
           '--disable-setuid-sandbox',
           '--disable-dev-shm-usage',
-          '--disable-gpu',
-          '--no-first-run',
-          '--no-zygote',
-          '--single-process'
+          '--disable-gpu'
         ]
       }
     });
 
+    console.log("CLIENT CREATED");
+    console.log("LOCALAUTH ENABLED");
+
     client.on('qr', async (qr) => {
-        console.log('[Client] QR_READY');
+        console.log('QR GENERATED');
         qrCodeRaw = qr;
         connectionStatus = 'QR_READY';
         try {
@@ -129,7 +128,7 @@ const initializeClient = () => {
     });
 
     client.on('ready', () => {
-        console.log('[Client] READY');
+        console.log('WHATSAPP READY');
         connectionStatus = 'CONNECTED';
         qrCodeImage = null;
         qrCodeRaw = null;
