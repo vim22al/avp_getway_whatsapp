@@ -95,17 +95,15 @@ const initializeClient = () => {
     qrCodeImage = null;
     qrCodeRaw = null;
 
-    const chromeProfilePath = `/tmp/chrome-profile-${Date.now()}`;
-    console.log(`[Chrome] Using profile: ${chromeProfilePath}`);
     console.log('[Client] Browser launching');
     
     client = new Client({
       authStrategy: new LocalAuth({
-        clientId: 'avpcrm'
+        clientId: 'avpcrm',
+        dataPath: './auth'
       }),
       puppeteer: {
         headless: true,
-        userDataDir: chromeProfilePath,
         args: [
           '--no-sandbox',
           '--disable-setuid-sandbox',
