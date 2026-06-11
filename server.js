@@ -62,12 +62,33 @@ const triggerWebhook = async (event, data) => {
     }
 };
 
+// Clear stale lock files from Chrome user data dir
+const clearLocks = () => {
+    const sessionDir = path.join(SESSION_PATH, 'session');
+    const lockFiles = ['SingletonLock', 'SingletonCookie', 'SingletonSocket'];
+    if (fs.existsSync(sessionDir)) {
+        lockFiles.forEach(file => {
+            const filePath = path.join(sessionDir, file);
+            if (fs.existsSync(filePath)) {
+                try {
+                    fs.unlinkSync(filePath);
+                    console.log(`[Client] Cleared stale lock file: ${filePath}`);
+                } catch (e) {
+                    console.error(`[Client] Failed to clear lock file: ${filePath}`, e.message);
+                }
+            }
+        });
+    }
+};
+
 // Initialize WhatsApp Client
-const initializeClient = () => {
+const initializeClient = (retryCount = 0) => {
     if (client) {
         console.log('[Client] Client already exists. Skipping initialization.');
         return;
     }
+
+    clearLocks();
 
     console.log('[Client] Starting initialization...');
     connectionStatus = 'INITIALIZING';
@@ -80,10 +101,9 @@ const initializeClient = () => {
             '--no-sandbox',
             '--disable-setuid-sandbox',
             '--disable-dev-shm-usage',
-            '--disable-accelerated-2d-canvas',
+            '--disable-gpu',
             '--no-first-run',
-            '--no-zygote',
-            '--disable-gpu'
+            '--no-zygote'
         ]
     };
 
@@ -101,7 +121,7 @@ const initializeClient = () => {
     });
 
     client.on('qr', async (qr) => {
-        console.log('[Client] QR Code generated!');
+        console.log('[Client] QR Generated');
         qrCodeRaw = qr;
         connectionStatus = 'QR_READY';
         try {
@@ -113,7 +133,8 @@ const initializeClient = () => {
     });
 
     client.on('ready', () => {
-        console.log('[Client] WhatsApp is ready!');
+        console.log('[Client] WhatsApp Client Ready');
+        console.log('[Client] Connected');
         connectionStatus = 'CONNECTED';
         qrCodeImage = null;
         qrCodeRaw = null;
@@ -124,7 +145,7 @@ const initializeClient = () => {
     });
 
     client.on('authenticated', () => {
-        console.log('[Client] Authenticated successfully');
+        console.log('[Client] Authenticated');
     });
 
     client.on('auth_failure', (msg) => {
@@ -182,8 +203,13 @@ const initializeClient = () => {
     });
 
     client.initialize().catch(err => {
-        console.error('[Client] Initialization error:', err);
+        console.error('[Client] Initialization error:', err.message || err);
         connectionStatus = 'DISCONNECTED';
+        client = null;
+        if (retryCount < 3) {
+            console.log(`[Client] Retrying initialization (${retryCount + 1}/3) in 5s...`);
+            setTimeout(() => initializeClient(retryCount + 1), 5000);
+        }
     });
 };
 
