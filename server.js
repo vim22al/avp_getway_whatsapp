@@ -72,10 +72,10 @@ const startupCleanup = () => {
     } catch (e) {}
 
     try {
-        // Force delete all potential Chrome lock files across common whatsapp-web.js paths
-        execSync('rm -rf .wwebjs_auth/**/Singleton* || true');
-        execSync('rm -rf .session/**/Singleton* || true');
-        execSync('rm -rf .auth/*Singleton* || true');
+        execSync('rm -rf /tmp/chrome-profile* || true');
+        execSync('rm -f .wwebjs_auth/**/Singleton* || true');
+        execSync('rm -f .session/**/Singleton* || true');
+        execSync('rm -f .auth/*Singleton* || true');
     } catch (e) {}
 };
 
@@ -95,6 +95,8 @@ const initializeClient = () => {
     qrCodeImage = null;
     qrCodeRaw = null;
 
+    const chromeProfilePath = `/tmp/chrome-profile-${Date.now()}`;
+    console.log(`[Chrome] Using profile: ${chromeProfilePath}`);
     console.log('[Client] Browser launching');
     
     client = new Client({
@@ -103,6 +105,7 @@ const initializeClient = () => {
       }),
       puppeteer: {
         headless: true,
+        userDataDir: chromeProfilePath,
         args: [
           '--no-sandbox',
           '--disable-setuid-sandbox',
@@ -198,11 +201,16 @@ const initializeClient = () => {
         });
     });
 
-    client.initialize().catch(err => {
+    client.initialize().then(() => {
+        console.log('[Chrome] Launch successful');
+    }).catch(err => {
         console.error('[Client] Initialization error:', err.message || err);
         connectionStatus = 'DISCONNECTED';
         global.whatsappClientInitialized = false;
-        destroyClient();
+        destroyClient().then(() => {
+            console.log('[Client] Retrying initialization...');
+            setTimeout(initializeClient, 3000);
+        });
     });
 };
 
@@ -431,7 +439,20 @@ app.post(['/reconnect', '/initialize'], authenticate, async (req, res) => {
         qrCodeRaw = null;
         
         initializeClient();
-        res.json({ success: true, message: 'Initialization started' });
+        
+        // Wait until QR_READY or CONNECTED to return success
+        let attempts = 0;
+        const checkReady = setInterval(() => {
+            attempts++;
+            if (connectionStatus === 'QR_READY' || connectionStatus === 'CONNECTED') {
+                clearInterval(checkReady);
+                res.json({ success: true, message: 'Initialization started' });
+            } else if (attempts > 30) { // 30 seconds timeout
+                clearInterval(checkReady);
+                res.status(500).json({ success: false, error: "Initialization timed out" });
+            }
+        }, 1000);
+
     } catch (err) {
         console.error('[API] Error during reconnect:', err);
         res.status(500).json({ success: false, error: err.message || "Unknown error" });
