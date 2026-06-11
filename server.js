@@ -27,7 +27,11 @@ let client = null;
 
 // Security Middleware
 const authenticate = (req, res, next) => {
-    const apiKey = req.headers['x-api-key'] || req.query.api_key;
+    let apiKey = req.headers['x-api-key'] || req.query.api_key;
+    const authHeader = req.headers['authorization'];
+    if (authHeader && authHeader.startsWith('Bearer ')) {
+        apiKey = authHeader.split(' ')[1];
+    }
     if (!apiKey || apiKey !== GATEWAY_API_KEY) {
         return res.status(401).json({ success: false, error: 'Unauthorized: Invalid or missing API key' });
     }
@@ -140,24 +144,41 @@ const initializeClient = () => {
         destroyClient();
     });
 
-    // Capture incoming and outgoing messages
+    // Capture incoming messages (from recipients/contacts)
     client.on('message', async (msg) => {
         // Exclude status updates and broadcast messages
-        if (msg.key && msg.key.remoteJid === 'status@broadcast') return;
-        
-        console.log(`[Client] Inbound message from ${msg.from}`);
-        handleMessage(msg);
+        if (msg.from === 'status@broadcast') return;
+        if (msg.id && msg.id.remote === 'status@broadcast') return;
+
+        const isGroup = msg.from && msg.from.endsWith('@g.us');
+        const sender = isGroup ? (msg.author || msg.from) : msg.from;
+        console.log(`[Incoming] Message received from ${sender} | Group: ${isGroup} | Body: ${(msg.body || '').substring(0, 60)}`);
+        handleMessage(msg, 'incoming');
     });
 
     // Capture messages sent from phone or gateway (outbox sync)
     client.on('message_create', async (msg) => {
-        if (msg.key && msg.key.remoteJid === 'status@broadcast') return;
-        
-        // If it's a message created by us, send it to the CRM so the CRM inbox stays synced!
+        if (msg.from === 'status@broadcast') return;
+        if (msg.id && msg.id.remote === 'status@broadcast') return;
+
+        // Only sync outbound messages (fromMe) to keep CRM inbox in sync
         if (msg.fromMe) {
-            console.log(`[Client] Outbound message created from this account to ${msg.to}`);
-            handleMessage(msg);
+            console.log(`[Outgoing] Message created from this account to ${msg.to} | Body: ${(msg.body || '').substring(0, 60)}`);
+            handleMessage(msg, 'outgoing');
         }
+    });
+
+    // Track message acknowledgements (sent → delivered → read)
+    client.on('message_ack', async (msg, ack) => {
+        // ack: 0=error, 1=pending, 2=received by server, 3=delivered, 4=read, 5=played
+        const ackMap = { 0: 'error', 1: 'pending', 2: 'server', 3: 'delivered', 4: 'read', 5: 'played' };
+        const ackLabel = ackMap[ack] || 'unknown';
+        console.log(`[ACK] Message ${msg.id._serialized} ack updated → ${ackLabel} (${ack})`);
+        triggerWebhook('message_ack', {
+            id: msg.id._serialized,
+            ack: ack,
+            ack_label: ackLabel
+        });
     });
 
     client.initialize().catch(err => {
@@ -167,10 +188,23 @@ const initializeClient = () => {
 };
 
 // Handle and format message details to send to CRM
-const handleMessage = async (msg) => {
+const handleMessage = async (msg, direction = 'unknown') => {
+    const isGroup = msg.from && msg.from.endsWith('@g.us');
+
+    // For group messages, the actual sender phone is in msg.author (e.g. "91XXXXXXXXXX@c.us")
+    // For private messages, sender is msg.from
+    const effectiveFrom = isGroup ? (msg.author || msg.from) : msg.from;
+    const effectiveTo = msg.to || (msg.fromMe ? effectiveFrom : null);
+
+    // Extract contact display name (notifyName is the WhatsApp display name of sender)
+    const contactName = (msg._data && msg._data.notifyName) || '';
+
+    console.log(`[handleMessage] direction=${direction} | from=${effectiveFrom} | to=${effectiveTo} | isGroup=${isGroup} | name="${contactName}" | body="${(msg.body||'').substring(0,80)}"`);
+
     let mediaData = null;
     if (msg.hasMedia) {
         try {
+            console.log(`[handleMessage] Downloading media for message ${msg.id._serialized}...`);
             const media = await msg.downloadMedia();
             if (media) {
                 mediaData = {
@@ -178,23 +212,31 @@ const handleMessage = async (msg) => {
                     data: media.data, // base64 representation
                     filename: media.filename || 'attachment'
                 };
+                console.log(`[handleMessage] Media downloaded: ${media.mimetype} (${media.filename || 'no filename'})`);
             }
         } catch (err) {
-            console.error('[Client] Failed to download media:', err.message);
+            console.error(`[handleMessage] Failed to download media for ${msg.id._serialized}:`, err.message);
         }
     }
 
-    triggerWebhook('message', {
+    const payload = {
         id: msg.id._serialized,
-        from: msg.from,
-        to: msg.to,
+        from: effectiveFrom,
+        to: effectiveTo,
+        chat_id: msg.from,  // The chat/conversation JID (group or individual)
         body: msg.body,
         fromMe: msg.fromMe,
         timestamp: msg.timestamp,
         hasMedia: msg.hasMedia,
         media: mediaData,
+        contact_name: contactName,
+        is_group: isGroup,
         deviceType: msg.deviceType
-    });
+    };
+
+    console.log(`[handleMessage] Sending webhook 'message' event to CRM | msgId=${msg.id._serialized}`);
+    triggerWebhook('message', payload);
+    console.log(`[handleMessage] Webhook dispatched for msgId=${msg.id._serialized}`);
 };
 
 const destroyClient = async () => {
@@ -214,7 +256,7 @@ initializeClient();
 // --- API ROUTES ---
 
 // GET /status - Fetch current connection status
-app.get('/status', authenticate, (req, res) => {
+app.get(['/status', '/api/status'], authenticate, (req, res) => {
     res.json({
         success: true,
         status: connectionStatus,
@@ -403,6 +445,147 @@ app.get('/sync-chats', authenticate, async (req, res) => {
         res.json({ success: true, message: `Synced ${result.count} chats to CRM.`, count: result.count });
     } else {
         res.status(503).json({ success: false, error: result.error || 'Sync failed.' });
+    }
+});
+
+
+// --- NEW LIVE DATA ENDPOINTS ---
+
+app.get(['/get-chats', '/api/chats'], authenticate, async (req, res) => {
+    if (connectionStatus !== 'CONNECTED' || !client) return res.status(503).json({ success: false, error: 'Not connected.' });
+    const limit = Math.min(parseInt(req.query.limit) || 100, 200);
+    try {
+        const allChats = await client.getChats();
+        const filtered = allChats.filter(c => c.id._serialized !== 'status@broadcast').slice(0, limit);
+        const chats = filtered.map(chat => {
+            const lastMsg = chat.lastMessage;
+            return {
+                chat_id: chat.id._serialized,
+                name: chat.name || chat.id.user || chat.id._serialized,
+                phone: chat.isGroup ? null : chat.id.user,
+                is_group: chat.isGroup ? 1 : 0,
+                unread_count: chat.unreadCount || 0,
+                is_pinned: chat.pinned ? 1 : 0,
+                is_archived: chat.archived ? 1 : 0,
+                timestamp: chat.timestamp || 0,
+                last_message: lastMsg ? (lastMsg.body || '') : '',
+                last_message_type: lastMsg ? (lastMsg.type || 'chat') : '',
+                last_message_from_me: lastMsg ? (lastMsg.fromMe ? 1 : 0) : 0,
+                last_message_ts: lastMsg ? lastMsg.timestamp : 0,
+                participants_count: (chat.isGroup && chat.participants) ? chat.participants.length : 0
+            };
+        });
+        res.json({ success: true, chats, count: chats.length });
+    } catch (err) {
+        console.error('[get-chats] Error:', err.message);
+        res.status(500).json({ success: false, error: err.message });
+    }
+});
+
+app.get(['/get-messages', '/api/messages'], authenticate, async (req, res) => {
+    if (connectionStatus !== 'CONNECTED' || !client) return res.status(503).json({ success: false, error: 'Not connected.' });
+    const { chatId, before } = req.query;
+    const limit = Math.min(parseInt(req.query.limit) || 50, 100);
+    if (!chatId) return res.status(400).json({ success: false, error: 'chatId is required.' });
+    try {
+        console.log('[get-messages] Fetching messages for chat:', chatId);
+        const chat = await client.getChatById(chatId);
+        const fetchOptions = { limit };
+        if (before) fetchOptions.before = before;
+        const messages = await chat.fetchMessages(fetchOptions);
+        const formatted = messages.map(msg => ({
+            id: msg.id._serialized,
+            body: msg.body || '',
+            type: msg.type || 'chat',
+            from: msg.from,
+            to: msg.to,
+            from_me: msg.fromMe ? 1 : 0,
+            timestamp: msg.timestamp,
+            has_media: msg.hasMedia ? 1 : 0,
+            media_mime: (msg.hasMedia && msg._data) ? (msg._data.mimetype || '') : '',
+            media_filename: (msg.hasMedia && msg._data) ? (msg._data.filename || '') : '',
+            author: msg.author || null,
+            is_forwarded: msg.isForwarded ? 1 : 0,
+            quoted_body: (msg.hasQuotedMsg && msg._data && msg._data.quotedMsg) ? msg._data.quotedMsg.body : null,
+            ack: msg.ack || 0,
+            notify_name: msg._data ? (msg._data.notifyName || '') : '',
+            duration: msg._data ? (msg._data.duration || null) : null
+        }));
+        res.json({ success: true, messages: formatted, chat_id: chatId });
+    } catch (err) {
+        console.error('[get-messages] Error:', err.message);
+        res.status(500).json({ success: false, error: err.message });
+    }
+});
+
+app.get('/get-media', authenticate, async (req, res) => {
+    if (connectionStatus !== 'CONNECTED' || !client) return res.status(503).json({ success: false, error: 'Not connected.' });
+    const { msgId, chatId } = req.query;
+    if (!msgId || !chatId) return res.status(400).json({ success: false, error: 'msgId and chatId required.' });
+    try {
+        const chat = await client.getChatById(chatId);
+        const messages = await chat.fetchMessages({ limit: 100 });
+        const target = messages.find(m => m.id._serialized === msgId);
+        if (!target) return res.status(404).json({ success: false, error: 'Message not found.' });
+        if (!target.hasMedia) return res.status(400).json({ success: false, error: 'No media.' });
+        const media = await target.downloadMedia();
+        res.json({ success: true, mimetype: media.mimetype, data: media.data, filename: media.filename || 'attachment' });
+    } catch (err) {
+        res.status(500).json({ success: false, error: err.message });
+    }
+});
+
+app.get(['/get-contact-pic', '/api/contact-pic'], authenticate, async (req, res) => {
+    if (connectionStatus !== 'CONNECTED' || !client) return res.status(503).json({ success: false, error: 'Not connected.' });
+    const { phone } = req.query;
+    if (!phone) return res.status(400).json({ success: false, error: 'phone required.' });
+    try {
+        const jid = phone.includes('@') ? phone : (phone + '@c.us');
+        const picUrl = await client.getProfilePicUrl(jid);
+        res.json({ success: true, url: picUrl || null });
+    } catch (err) {
+        res.json({ success: true, url: null });
+    }
+});
+
+app.get('/get-chat-info', authenticate, async (req, res) => {
+    if (connectionStatus !== 'CONNECTED' || !client) return res.status(503).json({ success: false, error: 'Not connected.' });
+    const { chatId } = req.query;
+    if (!chatId) return res.status(400).json({ success: false, error: 'chatId required.' });
+    try {
+        const chat = await client.getChatById(chatId);
+        let profilePic = null;
+        try { profilePic = await client.getProfilePicUrl(chatId); } catch (e) {}
+        const info = {
+            chat_id: chat.id._serialized, name: chat.name || chat.id.user,
+            is_group: chat.isGroup, is_pinned: chat.pinned, is_archived: chat.archived,
+            profile_pic: profilePic, timestamp: chat.timestamp, unread_count: chat.unreadCount
+        };
+        if (chat.isGroup && chat.participants) {
+            info.participants = chat.participants.map(p => ({ id: p.id._serialized, phone: p.id.user, is_admin: p.isAdmin }));
+        }
+        res.json({ success: true, info });
+    } catch (err) {
+        res.status(500).json({ success: false, error: err.message });
+    }
+});
+
+app.get('/api/contacts', authenticate, async (req, res) => {
+    if (connectionStatus !== 'CONNECTED' || !client) return res.status(503).json({ success: false, error: 'Not connected.' });
+    try {
+        const contacts = await client.getContacts();
+        const formatted = contacts.map(c => ({
+            id: c.id._serialized,
+            number: c.number,
+            name: c.name,
+            pushname: c.pushname,
+            isGroup: c.isGroup,
+            isMyContact: c.isMyContact
+        }));
+        res.json({ success: true, contacts: formatted, count: formatted.length });
+    } catch (err) {
+        console.error('[/api/contacts] Error:', err.message);
+        res.status(500).json({ success: false, error: err.message });
     }
 });
 
